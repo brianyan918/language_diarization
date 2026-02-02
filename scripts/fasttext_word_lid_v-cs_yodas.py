@@ -8,6 +8,8 @@ import fasttext
 
 WS_SPLIT = re.compile(r"\s+")
 
+### SAME SCRIPT, DIFFERENT SOURCE DATA FORMAT
+
 # Minimal ISO-3 -> ISO-2 mapping for common cases.
 # Extend as needed.
 ISO3_TO_ISO2 = {
@@ -42,12 +44,11 @@ ISO3_TO_ISO2 = {
     "ind": "id",
     "mal": "ms",
     "tgl": "tl",
-    "ben": "bn"
     # add more if your dataset needs them
 }
 
 def iso3_candidates(lang_field: str) -> List[str]:
-    return [x.strip() for x in lang_field.split("-") if x.strip()]
+    return [x.strip() for x in lang_field.split("-") if x.strip()] + ["eng"]
 
 def iso3_to_fasttext_label(iso3: str) -> Optional[str]:
     """
@@ -130,7 +131,7 @@ def main():
                 continue
             rec = json.loads(line)
 
-            text = rec.get("text", "")
+            text = rec.get("context_text", "")
             lang_field = rec.get("language", "")
             cand_iso3 = iso3_candidates(lang_field)
 
