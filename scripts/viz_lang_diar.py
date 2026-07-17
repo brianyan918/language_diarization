@@ -236,9 +236,14 @@ def main():
     ap.add_argument("--input_jsonl_glob", help='Glob for sharded JSONLs (e.g., "/path/*.jsonl").')
     ap.add_argument("--vocab", required=True)
     ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--num", type=int, default=20, help="Number of utterances to visualize (first N after sorting).")
+    ap.add_argument("--num", type=int, default=20, help="Number of utterances to visualize.")
     ap.add_argument("--max_duration", type=float, default=0.0)
     ap.add_argument("--prefix", type=str, default="utt")
+
+    # NEW
+    ap.add_argument("--shuffle", action="store_true", help="Shuffle utterances before selecting first N.")
+    ap.add_argument("--seed", type=int, default=None, help="Random seed for shuffling.")
+
     args = ap.parse_args()
 
     tok2id, id2tok = load_vocab_id_token(args.vocab)
@@ -254,8 +259,7 @@ def main():
     ):
         if not isinstance(obj, dict) or len(obj) != 1:
             continue
-
-        utt_key = next(iter(obj.keys()))  # e.g. "1330"
+        utt_key = next(iter(obj.keys()))
         entry = obj[utt_key]
         all_utts.append((utt_key, entry))
 
@@ -263,9 +267,7 @@ def main():
         raise RuntimeError("No valid utterances found in input.")
 
     # ------------------------------------------------------------------
-    # Sort by utterance key
-    #   - numeric if possible
-    #   - otherwise lexicographic
+    # Deterministic sort
     # ------------------------------------------------------------------
     def sort_key(x):
         k = x[0]
@@ -275,6 +277,15 @@ def main():
             return k
 
     all_utts.sort(key=sort_key)
+
+    # ------------------------------------------------------------------
+    # Optional shuffle
+    # ------------------------------------------------------------------
+    if args.shuffle:
+        import random
+        if args.seed is not None:
+            random.seed(args.seed)
+        random.shuffle(all_utts)
 
     # Take first N
     selected = all_utts[: args.num]
@@ -297,7 +308,6 @@ def main():
         plot_utt(ref, hyp, title, id2tok, out_path, max_duration=max_dur)
 
     print(f"Wrote {len(selected)} figures to: {args.out_dir}")
-
 
 if __name__ == "__main__":
     main()

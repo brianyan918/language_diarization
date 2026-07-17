@@ -214,6 +214,17 @@ def confusion_type(a: str, b: str) -> str:
     return "?"
 
 
+def strip_id_prefix(s: str) -> str:
+    """
+    Strip prefix from id/language.
+    E.g., 'test-0-ara_1667_BT' -> 'ara_1667_BT'
+    or 'test-123-ara-eng' -> 'ara-eng'
+    Removes pattern like "test-NUMBER-" from the beginning.
+    """
+    # Strip pattern like "test-0-", "test-123-", etc.
+    return re.sub(r'^[a-z]+-\d+-', '', s)
+
+
 def top_k_confusions(conf: Dict[Tuple[str, str], int], k: int, only_type: Optional[str] = None):
     items = []
     for (a, b), cnt in conf.items():
@@ -256,6 +267,11 @@ def main():
         help="If >0, also print top-K confusions separately for SUB, INS, DEL (global).",
     )
     ap.add_argument("--out_json", default=None, help="Optional path to write summary JSON")
+    ap.add_argument(
+        "--ignore_id_prefix",
+        action="store_true",
+        help="Strip prefix from id and language fields (e.g., 'test-0-' in 'test-0-ara_1667_BT')",
+    )
     args = ap.parse_args()
 
     exclude = set(args.exclude_langs)
@@ -294,6 +310,8 @@ def main():
             rec = json.loads(line)
 
             lang = safe_str(rec.get(args.lang_field, "UNKNOWN"))
+            if args.ignore_id_prefix:
+                lang = strip_id_prefix(lang)
 
             if lang in exclude or (include is not None and lang not in include):
                 skipped_excluded += 1

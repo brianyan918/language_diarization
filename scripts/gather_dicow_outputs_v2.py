@@ -42,6 +42,10 @@ def main():
         action="store_true",
         help="Skip ids missing hyp or ref instead of erroring",
     )
+    ap.add_argument(
+        "--ignore_id_prefix",
+        action="store_true",
+    )
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
@@ -81,6 +85,8 @@ def main():
 
             # language: <id>.split("_")[0] + "-eng"
             base_lang = id_.split("_", 1)[0]
+            if args.ignore_id_prefix:
+                base_lang = base_lang.rsplit("-", 1)[-1]
             language = f"{base_lang}-eng"
 
             out_obj = {

@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-score_switch_f1.py (FIXED, MONOTONIC IN tol)
+score_switch_f1.py (MONOTONIC IN tol + switch-count stats)
 
-Key fixes vs your version:
-1) Matching is now optimal 1D max-TP matching (two-pointer).
+Key fixes vs earlier versions:
+1) Matching is optimal 1D max-TP matching (two-pointer).
    => TP is non-decreasing as tol increases; recall cannot drop with larger tol.
 2) FP_within / FP_far are computed AFTER matching (diagnostics only),
    so they don't interfere with TP/FN.
+3) NEW: report switch-count stats (avg/min/max) for REF and HYP switches per utterance.
 
-Everything else (formats, switch extraction, bucket reporting) kept the same.
+About hyp switch counting:
+- We count a HYP switch at time b.start whenever two adjacent *merged* hyp segments
+  differ in label and their gap is in [0, max_gap] (overlaps ignored; large gaps ignored).
+- This mirrors ref switch extraction and avoids counting switches across big silences.
+
+Input formats supported:
+- "flat": {"segments":[...], "pred":[...], "language": "..."}
+- "nested": {"<utt_key>": {"pred":[...], "passthrough":{"segment_timestamps":..., "segment_langs":...}}}
 """
 
 import argparse
@@ -142,10 +150,10 @@ def extract_hyp_segments_flat(obj: dict, id2tok: Dict[int, str]) -> List[Seg]:
 
 
 def extract_ref_switches(ref: List[Seg], max_gap: float) -> List[RefSwitch]:
-    out = []
+    out: List[RefSwitch] = []
     for a, b in zip(ref[:-1], ref[1:]):
         gap = b.start - a.end
-        if gap < -1e-6:
+        if gap < -1e-6:  # overlap / disorder
             continue
         if gap > max_gap:
             continue
@@ -156,10 +164,14 @@ def extract_ref_switches(ref: List[Seg], max_gap: float) -> List[RefSwitch]:
 
 
 def extract_pred_switch_times(hyp: List[Seg], max_gap: float) -> List[float]:
-    out = []
+    """
+    Count a hypothesis switch when adjacent merged segments change label and
+    the gap is in [0, max_gap]. Large gaps are treated like "breaks" (no switch counted).
+    """
+    out: List[float] = []
     for a, b in zip(hyp[:-1], hyp[1:]):
         gap = b.start - a.end
-        if gap < -1e-6:
+        if gap < -1e-6:  # overlap / disorder
             continue
         if gap > max_gap:
             continue
@@ -190,13 +202,10 @@ def match_max_tp(ref_times: List[float], pred_times: List[float], tol: float):
         p = pred_times[j]
 
         if p < r - tol - 1e-9:
-            # pred too early to match this or any later ref
             j += 1
         elif p > r + tol + 1e-9:
-            # no remaining pred can match this ref
             i += 1
         else:
-            # match
             TP += 1
             matched_pred.add(j)
             i += 1
@@ -218,7 +227,6 @@ def fp_within_far(ref_times: List[float], pred_times: List[float], tol: float, m
     fp_within = 0
     fp_far = 0
 
-    # pointer over ref_times for neighborhood checks
     i = 0
     for j, p in enumerate(pred_times):
         if j in matched_pred_indices:
@@ -243,7 +251,7 @@ def fp_within_far(ref_times: List[float], pred_times: List[float], tol: float, m
 
 def match_one_utt(ref_sw: List[RefSwitch], pred_t: List[float], tol: float):
     """
-    Monotonic, correct per-utt matching:
+    Per-utt matching:
     - Maximize TP with two-pointer matching.
     - Bucket TP/FN by ref switch bucket.
     - Compute FP_within/FP_far diagnostics after matching.
@@ -254,16 +262,13 @@ def match_one_utt(ref_sw: List[RefSwitch], pred_t: List[float], tol: float):
     ref_times = [rs.t for rs in ref_sw]
     TP, FN, matched_pred = match_max_tp(ref_times, pred_t, tol)
 
-    # Bucket accounting for TP/FN:
-    # We need to know which ref switches were matched. With two-pointer matching,
-    # matches are in time order, so we can reconstruct which refs matched by replaying.
     bucket_ref = defaultdict(int)
     bucket_tp = defaultdict(int)
     bucket_fn = defaultdict(int)
     for rs in ref_sw:
         bucket_ref[rs.bucket] += 1
 
-    # Re-play matching to bucket TP/FN per ref
+    # Re-play matching to bucket TP/FN per ref (same greedy criterion as match_max_tp)
     i = j = 0
     while i < len(ref_sw) and j < len(pred_t):
         r = ref_sw[i].t
@@ -291,7 +296,6 @@ def match_one_utt(ref_sw: List[RefSwitch], pred_t: List[float], tol: float):
         "bucket_ref": bucket_ref,
         "bucket_tp": bucket_tp,
         "bucket_fn": bucket_fn,
-        "bucket_fp_within": defaultdict(int, {k: 0 for k in ["short", "medium", "long"]}),  # kept for compatibility
         "pred_switches": len(pred_t),
         "ref_switches": len(ref_sw),
     }
@@ -302,6 +306,16 @@ def prf(tp: int, fp: int, fn: int):
     r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
     return p, r, f1
+
+
+def summarize_counts(counts: List[int]):
+    if not counts:
+        return {"avg": 0.0, "min": 0, "max": 0}
+    return {
+        "avg": sum(counts) / len(counts),
+        "min": min(counts),
+        "max": max(counts),
+    }
 
 
 # -------------------------
@@ -327,11 +341,16 @@ def main():
     per = defaultdict(
         lambda: {
             "TP": 0, "FN": 0, "FP_within": 0, "FP_far": 0, "RefSwitches": 0, "PredSwitches": 0,
-            "b_ref": defaultdict(int), "b_tp": defaultdict(int), "b_fn": defaultdict(int)
+            "b_ref": defaultdict(int), "b_tp": defaultdict(int), "b_fn": defaultdict(int),
+            "ref_counts": [], "pred_counts": [],
         }
     )
 
     utts = 0
+
+    # NEW: per-utt switch count stats
+    ref_counts: List[int] = []
+    pred_counts: List[int] = []
 
     for obj in iter_jsonl_inputs(args.input_jsonl, args.input_jsonl_glob):
         utts += 1
@@ -348,6 +367,10 @@ def main():
 
         ref_sw = extract_ref_switches(ref, args.max_gap)
         pred_sw = extract_pred_switch_times(hyp, args.max_gap)
+
+        # NEW: track switch counts per utterance
+        ref_counts.append(len(ref_sw))
+        pred_counts.append(len(pred_sw))
 
         res = match_one_utt(ref_sw, pred_sw, args.tol)
 
@@ -371,6 +394,8 @@ def main():
             d["FP_far"] += res["FP_far"]
             d["RefSwitches"] += res["ref_switches"]
             d["PredSwitches"] += res["pred_switches"]
+            d["ref_counts"].append(len(ref_sw))
+            d["pred_counts"].append(len(pred_sw))
             for b in ["short", "medium", "long"]:
                 d["b_ref"][b] += res["bucket_ref"][b]
                 d["b_tp"][b] += res["bucket_tp"][b]
@@ -385,24 +410,46 @@ def main():
     )
     print(f"P={P:.6f}  R={R:.6f}  F1={F1:.6f}")
 
+    # NEW: switch-count stats
+    rs = summarize_counts(ref_counts)
+    ps = summarize_counts(pred_counts)
+    print("=== SWITCH COUNTS PER UTTERANCE ===")
+    print(
+        f"REF switches/utt: avg={rs['avg']:.3f}  min={rs['min']}  max={rs['max']}  "
+        f"(total={sum(ref_counts)})"
+    )
+    print(
+        f"HYP switches/utt: avg={ps['avg']:.3f}  min={ps['min']}  max={ps['max']}  "
+        f"(total={sum(pred_counts)})"
+    )
+
     print("=== BY SWITCH DURATION (bucketed by next REF segment duration) ===")
     for b in ["short", "medium", "long"]:
-        p, r, f1 = prf(gb_tp[b], 0, gb_fn[b])  # bucket FP is not well-defined; use global FP for global P
-        # If you want bucket precision, you need bucket FP attribution (non-trivial). We report recall/F1_proxy here.
-        print(
-            f"{b:6s}  ref={gb_ref[b]:7d}  tp={gb_tp[b]:7d}  fn={gb_fn[b]:7d}  "
-            f"R={r:.6f}"
-        )
+        _, rb, _ = prf(gb_tp[b], 0, gb_fn[b])  # bucket FP not attributed; report recall only
+        print(f"{b:6s}  ref={gb_ref[b]:7d}  tp={gb_tp[b]:7d}  fn={gb_fn[b]:7d}  R={rb:.6f}")
 
     if args.by_langpair:
         print("=== PER LANGUAGE-PAIR ===")
         for lp in sorted(per.keys(), key=lambda k: per[k]["RefSwitches"], reverse=True):
             d = per[lp]
             p, r, f1 = prf(d["TP"], d["FP_within"] + d["FP_far"], d["FN"])
-            print(f"[{lp}] RefSwitches={d['RefSwitches']} PredSwitches={d['PredSwitches']} P={p:.6f} R={r:.6f} F1={f1:.6f}")
+            rs_lp = summarize_counts(d["ref_counts"])
+            ps_lp = summarize_counts(d["pred_counts"])
+            print(
+                f"[{lp}] RefSwitches={d['RefSwitches']} PredSwitches={d['PredSwitches']} "
+                f"P={p:.6f} R={r:.6f} F1={f1:.6f}"
+            )
+            print(
+                f"  REF switches/utt: avg={rs_lp['avg']:.3f} min={rs_lp['min']} max={rs_lp['max']}"
+            )
+            print(
+                f"  HYP switches/utt: avg={ps_lp['avg']:.3f} min={ps_lp['min']} max={ps_lp['max']}"
+            )
             for b in ["short", "medium", "long"]:
                 _, rb, _ = prf(d["b_tp"][b], 0, d["b_fn"][b])
-                print(f"  {b:6s}  ref={d['b_ref'][b]:7d} tp={d['b_tp'][b]:7d} fn={d['b_fn'][b]:7d}  R={rb:.6f}")
+                print(
+                    f"  {b:6s}  ref={d['b_ref'][b]:7d} tp={d['b_tp'][b]:7d} fn={d['b_fn'][b]:7d}  R={rb:.6f}"
+                )
 
 
 if __name__ == "__main__":

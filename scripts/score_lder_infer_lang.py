@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-score_lder.py
+score_lder_infer_lang.py
 
 Compute Language Diarization Error Rate (LDER) from JSONL predictions, plus:
   1) GLOBAL LDER
-  2) LDER BY REF LANGUAGE (restricted to time where the REF label is that language)
+  2) LDER BY INFERRED LANGUAGE (extracted from file_name in passthrough)
   3) Top confusions overall (time-weighted)
-  4) Top confusions grouped by ground-truth language (ref label)
+  4) Top confusions grouped by ground-truth language
 
-JSONL input: one JSON object per line:
+JSONL input: one JSON object per line with file_name in passthrough:
 {
-  "112": {
-    "pred": [...],
+  "1455": {
+    "pred": {"alignments": [...]},
     "passthrough": {
-      "utt_id": "test-112-ara_1916_BT",
+      "file_name": "/path/to/audio/cmn/cmn_1759_CC.wav",
       "segment_timestamps": [[...], ...],
-      "segment_langs": ["ara","eng",...],
+      "segment_langs": ["cmn","eng",...],
       ...
     }
   }
 }
+
+Language extraction:
+  From "/data/group_data/swl/old_home/byan/cs_fleurs_large/cs-fleurs/read/test/audio/cmn/cmn_1759_CC.wav"
+  Extract "cmn" (language code)
 
 Vocab file format:
   2 eng
@@ -29,24 +33,15 @@ Vocab file format:
 Metric (DER-style):
   LDER = (Miss + FA + Conf) / RefSpeech
 
-- Exact segment overlap (no frame discretization).
-- Optional boundary collar: ignore +/- collar seconds around REF label-change boundaries.
-- "Speech" is time covered by reference language segments (segment_timestamps), optionally excluding non_speech_id.
-- Hypothesis gaps are treated as NONSPEECH.
-
-NOTE on "LDER by ref":
-- This is computed over time where REF == that label:
-    LDER_ref = (Miss_ref + Conf_ref) / RefSpeech_ref
-  FA is not attributable to any specific REF language (it occurs when REF is non-speech), so it is not included.
-
 Usage:
-  python score_lder.py --input_jsonl x.jsonl --vocab vocab.txt --collar 0.25 --include_fa \
+  python score_lder_infer_lang.py --input_jsonl x.jsonl --vocab vocab.txt --collar 0.25 --include_fa \
     --conf_topk 50 --per_ref_topk 10 --min_ref_time 1.0
 """
 
 import argparse
 import glob
 import json
+import os
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple
 from collections import defaultdict
@@ -89,6 +84,42 @@ def invert_vocab(vocab: Dict[str, int]) -> Dict[int, str]:
     for tok, idx in vocab.items():
         inv[idx] = tok
     return inv
+
+
+def extract_lang_from_filename(file_name: str) -> Optional[str]:
+    """
+    Extract language code from file path.
+    
+    Examples:
+      "/path/to/audio/cmn/cmn_1759_CC.wav" -> "cmn"
+      "/path/to/audio/eng/eng_123_AB.wav" -> "eng"
+      "/path/to/test.wav" -> None
+    
+    Strategy: Look for 3-letter code in directory path before filename.
+    """
+    if not file_name:
+        return None
+    
+    # Get the directory part and filename
+    dir_path = os.path.dirname(file_name)
+    base_name = os.path.basename(file_name)
+    
+    # Remove extension from filename
+    name_without_ext = os.path.splitext(base_name)[0]
+    
+    # Try to extract 3-letter code from the start of the filename
+    if len(name_without_ext) >= 3:
+        potential_lang = name_without_ext[:3]
+        # Check if it looks like a language code (all lowercase letters)
+        if potential_lang.isalpha() and potential_lang.islower():
+            return potential_lang
+    
+    # Fallback: try to get from parent directory
+    parent_dir = os.path.basename(dir_path)
+    if len(parent_dir) == 3 and parent_dir.isalpha() and parent_dir.islower():
+        return parent_dir
+    
+    return None
 
 
 def iter_jsonl_inputs(
@@ -318,7 +349,7 @@ def compute_lder_and_confusions(
     return metrics, dict(conf_pairs)
 
 
-def compute_by_ref_breakdown(
+def compute_by_inferred_lang_breakdown(
     ref: List[Seg],
     hyp: List[Seg],
     collar: float,
@@ -410,10 +441,14 @@ def main():
     ap.add_argument("--per_utt", action="store_true", help="Print per-utterance metrics.")
 
     ap.add_argument("--conf_topk", type=int, default=25, help="Top-K OVERALL confusion pairs to print (by time).")
-    ap.add_argument("--per_ref_topk", type=int, default=10, help="Top-K confusions to print per REF language.")
-    ap.add_argument("--min_ref_time", type=float, default=0.0, help="Skip per-ref report if ref speech < this many seconds.")
+    ap.add_argument("--per_lang_topk", type=int, default=10, help="Top-K confusions to print per inferred LANGUAGE.")
+    ap.add_argument("--min_ref_time", type=float, default=0.0, help="Skip per-lang report if ref speech < this many seconds.")
+    ap.add_argument("--exclude_langs", type=str, default="", help="Comma-separated list of language codes to exclude (e.g., 'eng,ara').")
     ap.add_argument("--output_json", help="Optional path to save results as JSON.")
     args = ap.parse_args()
+    
+    # Parse excluded languages
+    excluded_langs = set(lang.strip() for lang in args.exclude_langs.split(",") if lang.strip())
 
     if (args.input_jsonl is None) == (args.input_jsonl_glob is None):
         raise ValueError("Provide exactly one of --input_jsonl or --input_jsonl_glob")
@@ -426,13 +461,14 @@ def main():
     g_conf_pairs: Dict[Tuple[int, int], float] = defaultdict(float)
     g_utts = 0
 
-    # Per-ref accumulators (post-collar, speech only)
-    ref_speech_by_label: Dict[int, float] = defaultdict(float)             # ref label -> seconds
-    miss_by_label: Dict[int, float] = defaultdict(float)                   # ref label -> seconds
-    conf_by_ref: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))  # ref -> hyp -> seconds
-    conf_total_by_ref: Dict[int, float] = defaultdict(float)               # ref -> seconds (sum over hyp!=ref)
+    # Per-inferred-lang accumulators (post-collar, speech only)
+    ref_speech_by_inferred_lang: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    miss_by_inferred_lang: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    conf_by_inferred_lang: Dict[str, Dict[int, Dict[int, float]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    conf_total_by_ref: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
 
     skipped_lines = 0
+    skipped_no_lang = 0
 
     for src, ln, obj in iter_jsonl_inputs(jsonl_path=args.input_jsonl, jsonl_glob=args.input_jsonl_glob):
         try:
@@ -449,6 +485,17 @@ def main():
             if isinstance(pred_list, dict) and "alignments" in pred_list:
                 pred_list = pred_list.get("alignments", [])
             passthrough = entry.get("passthrough", {})
+
+            # Extract language from file_name
+            file_name = passthrough.get("file_name", "")
+            inferred_lang = extract_lang_from_filename(file_name)
+            if not inferred_lang:
+                skipped_no_lang += 1
+                continue
+            
+            # Skip if language is excluded
+            if inferred_lang in excluded_langs:
+                continue
 
             seg_ts = passthrough.get("segment_timestamps", [])
             seg_langs = passthrough.get("segment_langs", [])
@@ -473,25 +520,25 @@ def main():
             for (r, h), t in conf_pairs.items():
                 g_conf_pairs[(r, h)] += t
 
-            # Per-ref breakdown (speech-only)
-            ref_t, miss_t, conf_map = compute_by_ref_breakdown(
+            # Per-inferred-lang breakdown (speech-only)
+            ref_t, miss_t, conf_map = compute_by_inferred_lang_breakdown(
                 ref,
                 hyp,
                 collar=args.collar,
                 non_speech_id=args.non_speech_id,
             )
             for rlab, t in ref_t.items():
-                ref_speech_by_label[rlab] += t
+                ref_speech_by_inferred_lang[inferred_lang][rlab] += t
             for rlab, t in miss_t.items():
-                miss_by_label[rlab] += t
+                miss_by_inferred_lang[inferred_lang][rlab] += t
             for rlab, hm in conf_map.items():
                 for hlab, t in hm.items():
-                    conf_by_ref[rlab][hlab] += t
-                    conf_total_by_ref[rlab] += t
+                    conf_by_inferred_lang[inferred_lang][rlab][hlab] += t
+                    conf_total_by_ref[inferred_lang][rlab] += t
 
             if args.per_utt:
                 print(
-                    f"{utt_key}\tLDER={metrics['LDER']:.6f}\t"
+                    f"{utt_key} [{inferred_lang}]\tLDER={metrics['LDER']:.6f}\t"
                     f"Miss={metrics['Miss']:.3f}s\tFA={metrics['FA']:.3f}s\t"
                     f"Conf={metrics['Conf']:.3f}s\tRefSpeech={metrics['RefSpeech']:.3f}s"
                 )
@@ -501,6 +548,8 @@ def main():
 
     if skipped_lines > 0:
         print(f"Skipped {skipped_lines} lines due to errors.")
+    if skipped_no_lang > 0:
+        print(f"Skipped {skipped_no_lang} lines due to missing inferred language.")
 
     # ---- Global report ----
     if g_ref <= EPS:
@@ -521,9 +570,9 @@ def main():
             "lder": g_lder,
             "fa_included": args.include_fa
         },
-        "by_ref_language": {},
+        "by_inferred_language": {},
         "top_confusions_overall": [],
-        "top_confusions_by_ref": {}
+        "top_confusions_by_inferred_lang": {}
     }
 
     print("=== GLOBAL ===")
@@ -534,34 +583,61 @@ def main():
     print(f"Conf: {g_conf:.3f}s")
     print(f"LDER: {g_lder:.6f}")
 
-    # ---- LDER by REF language (speech-only) ----
-    print("=== LDER BY REF LANGUAGE (speech-only; FA not included) ===")
-    # Sort by ref speech descending
-    ref_labels = sorted(ref_speech_by_label.keys(), key=lambda r: ref_speech_by_label[r], reverse=True)
-    if not ref_labels:
+    # ---- LDER by INFERRED LANGUAGE (speech-only) ----
+    print("=== LDER BY INFERRED LANGUAGE (from file_name; speech-only; FA not included) ===")
+    # Sort by inferred language alphabetically
+    inferred_langs = sorted(ref_speech_by_inferred_lang.keys())
+    if not inferred_langs:
         print("(none)")
     else:
-        for r in ref_labels:
-            ref_t = float(ref_speech_by_label.get(r, 0.0))
-            if ref_t < args.min_ref_time:
+        for inf_lang in inferred_langs:
+            ref_by_label = ref_speech_by_inferred_lang[inf_lang]
+            miss_by_label = miss_by_inferred_lang[inf_lang]
+            conf_by_ref = conf_by_inferred_lang[inf_lang]
+            
+            # Calculate totals for this inferred language
+            total_ref = sum(ref_by_label.values())
+            total_miss = sum(miss_by_label.values())
+            total_conf = sum(conf_total_by_ref[inf_lang].values())
+            
+            if total_ref < args.min_ref_time:
                 continue
-            miss_t = float(miss_by_label.get(r, 0.0))
-            conf_t = float(conf_total_by_ref.get(r, 0.0))
-            lder_r = (miss_t + conf_t) / ref_t if ref_t > EPS else float("nan")
+            
+            lder_inf = (total_miss + total_conf) / total_ref if total_ref > EPS else float("nan")
             
             # Add to JSON output
-            label_str = fmt_label(r, inv_vocab)
-            results["by_ref_language"][label_str] = {
-                "ref_speech": ref_t,
-                "miss": miss_t,
-                "conf": conf_t,
-                "lder": lder_r
+            results["by_inferred_language"][inf_lang] = {
+                "ref_speech": total_ref,
+                "miss": total_miss,
+                "conf": total_conf,
+                "lder": lder_inf,
+                "by_ref_label": {}
             }
             
             print(
-                f"[REF {label_str}] RefSpeech={ref_t:.3f}s  "
-                f"Miss={miss_t:.3f}s  Conf={conf_t:.3f}s  LDER={lder_r:.6f}"
+                f"[INFERRED LANG {inf_lang}] RefSpeech={total_ref:.3f}s  "
+                f"Miss={total_miss:.3f}s  Conf={total_conf:.3f}s  LDER={lder_inf:.6f}"
             )
+            
+            # Per-ref-label breakdown within this inferred language
+            for rlab in sorted(ref_by_label.keys()):
+                ref_t = float(ref_by_label.get(rlab, 0.0))
+                miss_t = float(miss_by_label.get(rlab, 0.0))
+                conf_t = float(conf_total_by_ref[inf_lang].get(rlab, 0.0))
+                lder_r = (miss_t + conf_t) / ref_t if ref_t > EPS else float("nan")
+                
+                ref_str = fmt_label(rlab, inv_vocab)
+                results["by_inferred_language"][inf_lang]["by_ref_label"][ref_str] = {
+                    "ref_speech": ref_t,
+                    "miss": miss_t,
+                    "conf": conf_t,
+                    "lder": lder_r
+                }
+                
+                print(
+                    f"  [REF {ref_str}] RefSpeech={ref_t:.3f}s  "
+                    f"Miss={miss_t:.3f}s  Conf={conf_t:.3f}s  LDER={lder_r:.6f}"
+                )
 
     # ---- Overall top confusions ----
     print("=== TOP CONFUSIONS OVERALL (ref -> hyp), time-weighted ===")
@@ -584,16 +660,10 @@ def main():
             
             print(f"{ref_str} -> {hyp_str}\t{t:.3f}s\t({pct:.2f}% of RefSpeech)")
 
-    # ---- Confusions grouped by ground-truth language ----
-    print("=== TOP CONFUSIONS BY GROUND-TRUTH LANGUAGE (REF) ===")
-    # Sort refs by confusion time (descending), with ref speech as tie-breaker
-    ref_labels2 = sorted(
-        ref_speech_by_label.keys(),
-        key=lambda r: (conf_total_by_ref.get(r, 0.0), ref_speech_by_label.get(r, 0.0)),
-        reverse=True,
-    )
-
-    if not ref_labels2:
+    # ---- Confusions grouped by inferred language ----
+    print("=== TOP CONFUSIONS BY INFERRED LANGUAGE ===")
+    
+    if not inferred_langs:
         print("(none)")
         if args.output_json:
             with open(args.output_json, 'w', encoding='utf-8') as f:
@@ -601,58 +671,77 @@ def main():
             print(f"\n=== Results saved to: {args.output_json} ===")
         return
 
-    for r in ref_labels2:
-        ref_t = float(ref_speech_by_label.get(r, 0.0))
-        if ref_t < args.min_ref_time:
-            continue
-
-        conf_t = float(conf_total_by_ref.get(r, 0.0))
-        conf_rate = (conf_t / ref_t) if ref_t > EPS else float("nan")
+    for inf_lang in inferred_langs:
+        ref_by_label = ref_speech_by_inferred_lang[inf_lang]
+        conf_by_ref = conf_by_inferred_lang[inf_lang]
         
-        ref_str = fmt_label(r, inv_vocab)
-
-        print(
-            f"[REF {ref_str}] RefSpeech={ref_t:.3f}s  Conf={conf_t:.3f}s  "
-            f"ConfRate={conf_rate:.4f}"
+        total_ref = sum(ref_by_label.values())
+        if total_ref < args.min_ref_time:
+            continue
+        
+        print(f"[INFERRED LANG {inf_lang}]")
+        
+        # Sort refs by confusion time (descending)
+        ref_labels = sorted(
+            ref_by_label.keys(),
+            key=lambda r: (conf_total_by_ref[inf_lang].get(r, 0.0), ref_by_label.get(r, 0.0)),
+            reverse=True,
         )
-
-        hyp_map = conf_by_ref.get(r, {})
-        if not hyp_map:
-            print("  (no confusions)")
-            results["top_confusions_by_ref"][ref_str] = {
-                "ref_speech": ref_t,
-                "total_conf": conf_t,
-                "conf_rate": conf_rate,
-                "confusions": []
-            }
-            continue
-
-        top_h = sorted(hyp_map.items(), key=lambda kv: kv[1], reverse=True)[: max(0, args.per_ref_topk)]
         
-        # Add to JSON output
-        confusion_list = []
-        for h, t in top_h:
-            pct_ref = 100.0 * t / ref_t if ref_t > EPS else 0.0
-            hyp_str = fmt_label(h, inv_vocab)
-            confusion_list.append({
-                "hyp": hyp_str,
-                "time": t,
-                "percent_of_ref_speech": pct_ref
-            })
-            print(f"  {ref_str} -> {hyp_str}\t{t:.3f}s\t({pct_ref:.2f}% of REF speech)")
+        lang_confusions = []
+        for rlab in ref_labels:
+            ref_t = float(ref_by_label.get(rlab, 0.0))
+            conf_t = float(conf_total_by_ref[inf_lang].get(rlab, 0.0))
+            conf_rate = (conf_t / ref_t) if ref_t > EPS else float("nan")
+            
+            ref_str = fmt_label(rlab, inv_vocab)
+            
+            hyp_map = conf_by_ref.get(rlab, {})
+            if not hyp_map:
+                print(f"  [REF {ref_str}] RefSpeech={ref_t:.3f}s  Conf={conf_t:.3f}s  ConfRate={conf_rate:.4f} (no confusions)")
+                continue
+            
+            print(f"  [REF {ref_str}] RefSpeech={ref_t:.3f}s  Conf={conf_t:.3f}s  ConfRate={conf_rate:.4f}")
+            
+            top_h = sorted(hyp_map.items(), key=lambda kv: kv[1], reverse=True)[: max(0, args.per_lang_topk)]
+            
+            confusion_list = []
+            for h, t in top_h:
+                pct_ref = 100.0 * t / ref_t if ref_t > EPS else 0.0
+                hyp_str = fmt_label(h, inv_vocab)
+                confusion_list.append({
+                    "hyp": hyp_str,
+                    "time": t,
+                    "percent_of_ref_speech": pct_ref
+                })
+                print(f"    {ref_str} -> {hyp_str}\t{t:.3f}s\t({pct_ref:.2f}% of REF speech)")
+            
+            lang_confusions.extend(confusion_list)
         
-        results["top_confusions_by_ref"][ref_str] = {
-            "ref_speech": ref_t,
-            "total_conf": conf_t,
-            "conf_rate": conf_rate,
-            "confusions": confusion_list
-        }
+        results["top_confusions_by_inferred_lang"][inf_lang] = lang_confusions
     
     # Save JSON output if requested
     if args.output_json:
         with open(args.output_json, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         print(f"\n=== Results saved to: {args.output_json} ===")
+    
+    # Print easy copy-paste section
+    print("\n" + "="*80)
+    print("EASY COPY-PASTE FORMAT (LDER by inferred language, alphabetically sorted)")
+    print("="*80 + "\n")
+    
+    for inf_lang in sorted(inferred_langs):
+        ref_by_label = ref_speech_by_inferred_lang[inf_lang]
+        total_ref = sum(ref_by_label.values())
+        if total_ref < args.min_ref_time:
+            continue
+        
+        total_miss = sum(miss_by_inferred_lang[inf_lang].values())
+        total_conf = sum(conf_total_by_ref[inf_lang].values())
+        lder_inf = (total_miss + total_conf) / total_ref if total_ref > EPS else float("nan")
+        
+        print(f"{lder_inf:.6f}")
 
 
 if __name__ == "__main__":

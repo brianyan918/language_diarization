@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 from typing import Dict, Any
 
 
@@ -21,6 +22,10 @@ def main():
         "--overwrite",
         action="store_true",
         help="Overwrite text even if target already has it",
+    )
+    ap.add_argument(
+        "--ignore_id_prefix",
+        action="store_true",
     )
     args = ap.parse_args()
 
@@ -46,6 +51,9 @@ def main():
 
             rec = json.loads(line)
             rid = str(rec.get(args.id_field))
+            if args.ignore_id_prefix:
+                # Strip pattern like "test-0-" or "test-123-"
+                rid = re.sub(r'^[a-z]+-\d+-', '', rid)
 
             has_text = args.text_field in rec and rec[args.text_field] not in (None, "")
 

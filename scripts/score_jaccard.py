@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-score_lder.py
+score_jaccard.py
 
-Compute Language Diarization Error Rate (LDER) from JSONL predictions, plus:
-  1) GLOBAL LDER
-  2) LDER BY REF LANGUAGE (restricted to time where the REF label is that language)
+Compute Jaccard Error Rate (JER) from JSONL predictions, plus:
+  1) GLOBAL JER
+  2) JER BY REF LANGUAGE (Jaccard similarity restricted to time where REF label is that language)
   3) Top confusions overall (time-weighted)
   4) Top confusions grouped by ground-truth language (ref label)
 
@@ -26,27 +26,28 @@ Vocab file format:
   3 ara
   ...
 
-Metric (DER-style):
-  LDER = (Miss + FA + Conf) / RefSpeech
+Jaccard Similarity (IoU):
+  For a given label pair, Jaccard = Intersection / Union of time intervals
+  JER = 1 - mean(Jaccard_i for all language pairs)
 
 - Exact segment overlap (no frame discretization).
 - Optional boundary collar: ignore +/- collar seconds around REF label-change boundaries.
 - "Speech" is time covered by reference language segments (segment_timestamps), optionally excluding non_speech_id.
-- Hypothesis gaps are treated as NONSPEECH.
-
-NOTE on "LDER by ref":
-- This is computed over time where REF == that label:
-    LDER_ref = (Miss_ref + Conf_ref) / RefSpeech_ref
-  FA is not attributable to any specific REF language (it occurs when REF is non-speech), so it is not included.
+- Optional inferred language filtering: extract language from file_name and exclude specified languages.
 
 Usage:
-  python score_lder.py --input_jsonl x.jsonl --vocab vocab.txt --collar 0.25 --include_fa \
+  python score_jaccard.py --input_jsonl x.jsonl --vocab vocab.txt --collar 0.25 \
     --conf_topk 50 --per_ref_topk 10 --min_ref_time 1.0
+  
+  With language exclusion (requires file_name in passthrough):
+  python score_jaccard.py --input_jsonl x.jsonl --vocab vocab.txt --exclude_langs "eng,ara" \
+    --collar 0.25
 """
 
 import argparse
 import glob
 import json
+import os
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple
 from collections import defaultdict
@@ -89,6 +90,42 @@ def invert_vocab(vocab: Dict[str, int]) -> Dict[int, str]:
     for tok, idx in vocab.items():
         inv[idx] = tok
     return inv
+
+
+def extract_lang_from_filename(file_name: str) -> Optional[str]:
+    """
+    Extract language code from file path.
+    
+    Examples:
+      "/path/to/audio/cmn/cmn_1759_CC.wav" -> "cmn"
+      "/path/to/audio/eng/eng_123_AB.wav" -> "eng"
+      "/path/to/test.wav" -> None
+    
+    Strategy: Look for 3-letter code in directory path before filename.
+    """
+    if not file_name:
+        return None
+    
+    # Get the directory part and filename
+    dir_path = os.path.dirname(file_name)
+    base_name = os.path.basename(file_name)
+    
+    # Remove extension from filename
+    name_without_ext = os.path.splitext(base_name)[0]
+    
+    # Try to extract 3-letter code from the start of the filename
+    if len(name_without_ext) >= 3:
+        potential_lang = name_without_ext[:3]
+        # Check if it looks like a language code (all lowercase letters)
+        if potential_lang.isalpha() and potential_lang.islower():
+            return potential_lang
+    
+    # Fallback: try to get from parent directory
+    parent_dir = os.path.basename(dir_path)
+    if len(parent_dir) == 3 and parent_dir.isalpha() and parent_dir.islower():
+        return parent_dir
+    
+    return None
 
 
 def iter_jsonl_inputs(
@@ -240,82 +277,111 @@ def in_any_interval(t: float, intervals: List[Tuple[float, float]], idx: int) ->
     return False, idx
 
 
+def collect_label_intervals(segs: List[Seg], label: int) -> List[Tuple[float, float]]:
+    """Collect all time intervals for a given label."""
+    intervals: List[Tuple[float, float]] = []
+    for seg in segs:
+        if seg.label == label:
+            intervals.append((seg.start, seg.end))
+    return merge_intervals(intervals)
+
+
+def interval_intersection_time(intervals_a: List[Tuple[float, float]], intervals_b: List[Tuple[float, float]]) -> float:
+    """Compute total time where intervals from A and B overlap."""
+    total = 0.0
+    for sa, ea in intervals_a:
+        for sb, eb in intervals_b:
+            intersection_start = max(sa, sb)
+            intersection_end = min(ea, eb)
+            if intersection_end > intersection_start:
+                total += intersection_end - intersection_start
+    return total
+
+
+def interval_union_time(intervals_a: List[Tuple[float, float]], intervals_b: List[Tuple[float, float]]) -> float:
+    """Compute total time covered by union of intervals from A and B."""
+    merged = merge_intervals(intervals_a + intervals_b)
+    return sum(e - s for s, e in merged)
+
+
 # -------------------------
 # Scoring
 # -------------------------
-def compute_lder_and_confusions(
+def compute_jer_and_confusions(
     ref: List[Seg],
     hyp: List[Seg],
     collar: float = 0.0,
     non_speech_id: Optional[int] = None,
-    include_fa: bool = True,
 ) -> Tuple[Dict[str, float], Dict[Tuple[int, int], float]]:
     """
     Returns:
-      metrics: {LDER, Miss, FA, Conf, RefSpeech}
-      conf_pairs: {(ref_label, hyp_label): confused_time_seconds} only when both speech and labels differ
+      metrics: {JER, Jaccard_mean, RefSpeech}
+      conf_pairs: {(ref_label, hyp_label): intersection_over_union} for all label pairs
+    
+    Note: Collar is NOT applied to Jaccard scoring since Jaccard (IoU) is already
+    robust to boundary misalignment. The collar concept (forgiveness zone) is more
+    relevant for frame-by-frame metrics like LDER.
     """
     ref = merge_adjacent(ref)
     hyp = merge_adjacent(hyp)
 
-    ref_scored, ignored = apply_boundary_collar_to_ref(ref, collar)
+    # Collect all speech labels from ref and hyp (excluding non_speech_id if provided)
+    ref_labels = set()
+    hyp_labels = set()
+    for seg in ref:
+        if non_speech_id is None or seg.label != non_speech_id:
+            ref_labels.add(seg.label)
+    for seg in hyp:
+        if non_speech_id is None or seg.label != non_speech_id:
+            hyp_labels.add(seg.label)
 
-    B = set()
-    for s in ref_scored:
-        B.add(s.start); B.add(s.end)
-    for s in hyp:
-        B.add(s.start); B.add(s.end)
-    for s, e in ignored:
-        B.add(s); B.add(e)
+    all_labels = ref_labels | hyp_labels
 
-    B = sorted(B)
-    if len(B) < 2:
+    if not all_labels:
         return (
-            {"LDER": float("nan"), "Miss": 0.0, "FA": 0.0, "Conf": 0.0, "RefSpeech": 0.0},
+            {"JER": float("nan"), "Jaccard_mean": float("nan"), "RefSpeech": 0.0},
             {},
         )
 
-    Miss = FA = Conf = RefSpeech = 0.0
-    conf_pairs: Dict[Tuple[int, int], float] = defaultdict(float)
+    # Compute Jaccard for each label
+    jaccard_scores: Dict[int, float] = {}
+    conf_pairs: Dict[Tuple[int, int], float] = {}
 
-    i = j = 0
-    ig_idx = 0
+    for label in all_labels:
+        ref_intervals = collect_label_intervals(ref, label)
+        hyp_intervals = collect_label_intervals(hyp, label)
 
-    for k in range(len(B) - 1):
-        t0, t1 = B[k], B[k + 1]
-        dt = t1 - t0
-        if dt <= EPS:
-            continue
+        intersection = interval_intersection_time(ref_intervals, hyp_intervals)
+        union = interval_union_time(ref_intervals, hyp_intervals)
 
-        inside_ignored, ig_idx = in_any_interval(t0, ignored, ig_idx)
-        if inside_ignored:
-            continue
-
-        rlab, i = label_at(ref_scored, i, t0)
-        hlab, j = label_at(hyp, j, t0)
-
-        r_is_speech = (rlab is not None) and (non_speech_id is None or rlab != non_speech_id)
-        h_is_speech = (hlab is not None) and (non_speech_id is None or hlab != non_speech_id)
-
-        if r_is_speech:
-            RefSpeech += dt
-            if not h_is_speech:
-                Miss += dt
-            else:
-                if hlab != rlab:
-                    Conf += dt
-                    conf_pairs[(rlab, hlab)] += dt
+        if union <= EPS:
+            jaccard = 1.0  # both are empty, perfect match
         else:
-            if h_is_speech:
-                FA += dt
+            jaccard = intersection / union
 
-    if RefSpeech <= EPS:
-        metrics = {"LDER": float("nan"), "Miss": Miss, "FA": FA, "Conf": Conf, "RefSpeech": RefSpeech}
-        return metrics, dict(conf_pairs)
+        jaccard_scores[label] = jaccard
+        # Store as (label, label) pair for reference
+        conf_pairs[(label, label)] = jaccard
 
-    numer = Miss + Conf + (FA if include_fa else 0.0)
-    metrics = {"LDER": numer / RefSpeech, "Miss": Miss, "FA": FA, "Conf": Conf, "RefSpeech": RefSpeech}
-    return metrics, dict(conf_pairs)
+    # Compute mean Jaccard
+    if jaccard_scores:
+        jaccard_mean = sum(jaccard_scores.values()) / len(jaccard_scores)
+    else:
+        jaccard_mean = float("nan")
+
+    jer = 1.0 - jaccard_mean if not (jaccard_mean != jaccard_mean) else float("nan")  # 1 - nan = nan
+
+    # Compute ref speech time (no collar applied)
+    ref_speech = sum(seg.end - seg.start for seg in ref
+                     if non_speech_id is None or seg.label != non_speech_id)
+
+    metrics = {
+        "JER": jer,
+        "Jaccard_mean": jaccard_mean,
+        "RefSpeech": ref_speech,
+    }
+
+    return metrics, conf_pairs
 
 
 def compute_by_ref_breakdown(
@@ -325,71 +391,49 @@ def compute_by_ref_breakdown(
     non_speech_id: Optional[int],
 ) -> Tuple[
     Dict[int, float],               # ref_speech_by_label
-    Dict[int, float],               # miss_by_label
-    Dict[int, Dict[int, float]],    # conf_by_ref[ref][hyp]
+    Dict[int, float],               # jaccard_by_label
 ]:
     """
     Breakdown restricted to intervals where REF is speech.
 
-    - ref_speech_by_label: total ref speech time per ref label (after collar carving)
-    - miss_by_label: time where REF=label but HYP is non-speech
-    - conf_by_ref: time where REF=ref_label but HYP=hyp_label (hyp is speech and hyp!=ref)
+    - ref_speech_by_label: total ref speech time per ref label
+    - jaccard_by_label: Jaccard IoU for each ref label
+    
+    Note: Collar is NOT applied to Jaccard scoring since Jaccard (IoU) is already
+    robust to boundary misalignment.
     """
     ref = merge_adjacent(ref)
     hyp = merge_adjacent(hyp)
 
-    ref_scored, ignored = apply_boundary_collar_to_ref(ref, collar)
+    # Collect labels that appear in ref as speech
+    ref_labels_speech = set()
+    for seg in ref:
+        if non_speech_id is None or seg.label != non_speech_id:
+            ref_labels_speech.add(seg.label)
 
-    B = set()
-    for s in ref_scored:
-        B.add(s.start); B.add(s.end)
-    for s in hyp:
-        B.add(s.start); B.add(s.end)
-    for s, e in ignored:
-        B.add(s); B.add(e)
+    if not ref_labels_speech:
+        return {}, {}
 
-    B = sorted(B)
-    ref_speech_by_label: Dict[int, float] = defaultdict(float)
-    miss_by_label: Dict[int, float] = defaultdict(float)
-    conf_by_ref: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    ref_speech_by_label: Dict[int, float] = {}
+    jaccard_by_label: Dict[int, float] = {}
 
-    if len(B) < 2:
-        return {}, {}, {}
+    for label in ref_labels_speech:
+        ref_intervals = collect_label_intervals(ref, label)
+        hyp_intervals = collect_label_intervals(hyp, label)
 
-    i = j = 0
-    ig_idx = 0
+        ref_speech_by_label[label] = sum(e - s for s, e in ref_intervals)
 
-    for k in range(len(B) - 1):
-        t0, t1 = B[k], B[k + 1]
-        dt = t1 - t0
-        if dt <= EPS:
-            continue
+        intersection = interval_intersection_time(ref_intervals, hyp_intervals)
+        union = interval_union_time(ref_intervals, hyp_intervals)
 
-        inside_ignored, ig_idx = in_any_interval(t0, ignored, ig_idx)
-        if inside_ignored:
-            continue
-
-        rlab, i = label_at(ref_scored, i, t0)
-        hlab, j = label_at(hyp, j, t0)
-
-        r_is_speech = (rlab is not None) and (non_speech_id is None or rlab != non_speech_id)
-        h_is_speech = (hlab is not None) and (non_speech_id is None or hlab != non_speech_id)
-
-        if not r_is_speech:
-            continue
-
-        # REF is speech
-        assert rlab is not None
-        ref_speech_by_label[rlab] += dt
-
-        if not h_is_speech:
-            miss_by_label[rlab] += dt
+        if union <= EPS:
+            jaccard = 1.0
         else:
-            if hlab != rlab:
-                conf_by_ref[rlab][hlab] += dt
+            jaccard = intersection / union
 
-    # convert nested defaultdicts to plain dicts
-    return dict(ref_speech_by_label), dict(miss_by_label), {r: dict(m) for r, m in conf_by_ref.items()}
+        jaccard_by_label[label] = jaccard
+
+    return ref_speech_by_label, jaccard_by_label
 
 
 def fmt_label(label: int, inv_vocab: Dict[int, str]) -> str:
@@ -406,14 +450,17 @@ def main():
     ap.add_argument("--vocab", required=True, help="Vocab file: '<id> <token>' per line.")
     ap.add_argument("--collar", type=float, default=0.0, help="Boundary collar seconds (e.g., 0.25).")
     ap.add_argument("--non_speech_id", type=int, default=None, help="Optional NONSPEECH label id.")
-    ap.add_argument("--include_fa", action="store_true", help="Include FA in GLOBAL LDER numerator (classic DER-style).")
     ap.add_argument("--per_utt", action="store_true", help="Print per-utterance metrics.")
 
-    ap.add_argument("--conf_topk", type=int, default=25, help="Top-K OVERALL confusion pairs to print (by time).")
-    ap.add_argument("--per_ref_topk", type=int, default=10, help="Top-K confusions to print per REF language.")
+    ap.add_argument("--conf_topk", type=int, default=25, help="Top-K OVERALL label pairs to print (by Jaccard).")
+    ap.add_argument("--per_ref_topk", type=int, default=10, help="Top-K labels to print per REF language.")
     ap.add_argument("--min_ref_time", type=float, default=0.0, help="Skip per-ref report if ref speech < this many seconds.")
+    ap.add_argument("--exclude_langs", type=str, default="", help="Comma-separated list of language codes to exclude (e.g., 'eng,ara'). Requires file_name in passthrough.")
     ap.add_argument("--output_json", help="Optional path to save results as JSON.")
     args = ap.parse_args()
+    
+    # Parse excluded languages
+    excluded_langs = set(lang.strip() for lang in args.exclude_langs.split(",") if lang.strip())
 
     if (args.input_jsonl is None) == (args.input_jsonl_glob is None):
         raise ValueError("Provide exactly one of --input_jsonl or --input_jsonl_glob")
@@ -422,17 +469,19 @@ def main():
     inv_vocab = invert_vocab(vocab)
 
     # Global accumulators
-    g_miss = g_fa = g_conf = g_ref = 0.0
-    g_conf_pairs: Dict[Tuple[int, int], float] = defaultdict(float)
+    g_jer = 0.0
+    g_jaccard_sum = 0.0
+    g_jaccard_count = 0
+    g_ref_speech = 0.0
+    g_label_jaccards: Dict[int, List[float]] = defaultdict(list)  # label -> list of jaccard scores
     g_utts = 0
 
     # Per-ref accumulators (post-collar, speech only)
-    ref_speech_by_label: Dict[int, float] = defaultdict(float)             # ref label -> seconds
-    miss_by_label: Dict[int, float] = defaultdict(float)                   # ref label -> seconds
-    conf_by_ref: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))  # ref -> hyp -> seconds
-    conf_total_by_ref: Dict[int, float] = defaultdict(float)               # ref -> seconds (sum over hyp!=ref)
+    ref_speech_by_label: Dict[int, float] = defaultdict(float)    # ref label -> seconds
+    jaccard_by_label: Dict[int, List[float]] = defaultdict(list)  # ref label -> list of Jaccard scores
 
     skipped_lines = 0
+    skipped_no_lang = 0
 
     for src, ln, obj in iter_jsonl_inputs(jsonl_path=args.input_jsonl, jsonl_glob=args.input_jsonl_glob):
         try:
@@ -449,6 +498,18 @@ def main():
             if isinstance(pred_list, dict) and "alignments" in pred_list:
                 pred_list = pred_list.get("alignments", [])
             passthrough = entry.get("passthrough", {})
+            
+            # Extract language from file_name if exclusion list is provided
+            if excluded_langs:
+                file_name = passthrough.get("file_name", "")
+                inferred_lang = extract_lang_from_filename(file_name)
+                if not inferred_lang:
+                    skipped_no_lang += 1
+                    continue
+                
+                # Skip if language is excluded
+                if inferred_lang in excluded_langs:
+                    continue
 
             seg_ts = passthrough.get("segment_timestamps", [])
             seg_langs = passthrough.get("segment_langs", [])
@@ -456,25 +517,27 @@ def main():
             ref = build_ref_segments(seg_ts, seg_langs, vocab)
             hyp = build_pred_segments(pred_list)
 
-            metrics, conf_pairs = compute_lder_and_confusions(
+            metrics, conf_pairs = compute_jer_and_confusions(
                 ref,
                 hyp,
                 collar=args.collar,
                 non_speech_id=args.non_speech_id,
-                include_fa=args.include_fa,
             )
 
             # Global sums
             g_utts += 1
-            g_miss += metrics["Miss"]
-            g_fa += metrics["FA"]
-            g_conf += metrics["Conf"]
-            g_ref += metrics["RefSpeech"]
-            for (r, h), t in conf_pairs.items():
-                g_conf_pairs[(r, h)] += t
+            if not (metrics["Jaccard_mean"] != metrics["Jaccard_mean"]):  # not NaN
+                g_jaccard_sum += metrics["Jaccard_mean"]
+                g_jaccard_count += 1
+            g_ref_speech += metrics["RefSpeech"]
+
+            # Accumulate label jaccards globally
+            for (label_a, label_b), jaccard in conf_pairs.items():
+                if label_a == label_b:  # Only label self-similarity
+                    g_label_jaccards[label_a].append(jaccard)
 
             # Per-ref breakdown (speech-only)
-            ref_t, miss_t, conf_map = compute_by_ref_breakdown(
+            ref_t, jac_t = compute_by_ref_breakdown(
                 ref,
                 hyp,
                 collar=args.collar,
@@ -482,18 +545,13 @@ def main():
             )
             for rlab, t in ref_t.items():
                 ref_speech_by_label[rlab] += t
-            for rlab, t in miss_t.items():
-                miss_by_label[rlab] += t
-            for rlab, hm in conf_map.items():
-                for hlab, t in hm.items():
-                    conf_by_ref[rlab][hlab] += t
-                    conf_total_by_ref[rlab] += t
+            for rlab, jac in jac_t.items():
+                jaccard_by_label[rlab].append(jac)
 
             if args.per_utt:
                 print(
-                    f"{utt_key}\tLDER={metrics['LDER']:.6f}\t"
-                    f"Miss={metrics['Miss']:.3f}s\tFA={metrics['FA']:.3f}s\t"
-                    f"Conf={metrics['Conf']:.3f}s\tRefSpeech={metrics['RefSpeech']:.3f}s"
+                    f"{utt_key}\tJER={metrics['JER']:.6f}\t"
+                    f"Jaccard_mean={metrics['Jaccard_mean']:.6f}\tRefSpeech={metrics['RefSpeech']:.3f}s"
                 )
         except Exception as e:
             skipped_lines += 1
@@ -501,41 +559,40 @@ def main():
 
     if skipped_lines > 0:
         print(f"Skipped {skipped_lines} lines due to errors.")
+    if skipped_no_lang > 0:
+        print(f"Skipped {skipped_no_lang} lines due to missing inferred language.")
 
     # ---- Global report ----
-    if g_ref <= EPS:
-        print("No reference speech time found; cannot compute LDER.")
+    if g_utts == 0:
+        print("No utterances processed.")
         return
 
-    g_numer = g_miss + g_conf + (g_fa if args.include_fa else 0.0)
-    g_lder = g_numer / g_ref
+    if g_jaccard_count > 0:
+        g_jaccard_mean = g_jaccard_sum / g_jaccard_count
+        g_jer = 1.0 - g_jaccard_mean
+    else:
+        g_jaccard_mean = float("nan")
+        g_jer = float("nan")
 
     # Prepare JSON output structure
     results = {
         "global": {
             "utts": g_utts,
-            "ref_speech": g_ref,
-            "miss": g_miss,
-            "fa": g_fa,
-            "conf": g_conf,
-            "lder": g_lder,
-            "fa_included": args.include_fa
+            "ref_speech": g_ref_speech,
+            "jaccard_mean": g_jaccard_mean,
+            "jer": g_jer,
         },
         "by_ref_language": {},
-        "top_confusions_overall": [],
-        "top_confusions_by_ref": {}
     }
 
     print("=== GLOBAL ===")
     print(f"Utts: {g_utts}")
-    print(f"RefSpeech: {g_ref:.3f}s")
-    print(f"Miss: {g_miss:.3f}s")
-    print(f"FA: {g_fa:.3f}s  (included: {args.include_fa})")
-    print(f"Conf: {g_conf:.3f}s")
-    print(f"LDER: {g_lder:.6f}")
+    print(f"RefSpeech: {g_ref_speech:.3f}s")
+    print(f"Jaccard (mean): {g_jaccard_mean:.6f}")
+    print(f"JER: {g_jer:.6f}")
 
-    # ---- LDER by REF language (speech-only) ----
-    print("=== LDER BY REF LANGUAGE (speech-only; FA not included) ===")
+    # ---- JER by REF language ----
+    print("=== JER BY REF LANGUAGE ===")
     # Sort by ref speech descending
     ref_labels = sorted(ref_speech_by_label.keys(), key=lambda r: ref_speech_by_label[r], reverse=True)
     if not ref_labels:
@@ -545,109 +602,27 @@ def main():
             ref_t = float(ref_speech_by_label.get(r, 0.0))
             if ref_t < args.min_ref_time:
                 continue
-            miss_t = float(miss_by_label.get(r, 0.0))
-            conf_t = float(conf_total_by_ref.get(r, 0.0))
-            lder_r = (miss_t + conf_t) / ref_t if ref_t > EPS else float("nan")
-            
-            # Add to JSON output
+
+            jac_list = jaccard_by_label.get(r, [])
+            if jac_list:
+                jac_mean = sum(jac_list) / len(jac_list)
+                jer_r = 1.0 - jac_mean
+            else:
+                jac_mean = float("nan")
+                jer_r = float("nan")
+
             label_str = fmt_label(r, inv_vocab)
             results["by_ref_language"][label_str] = {
                 "ref_speech": ref_t,
-                "miss": miss_t,
-                "conf": conf_t,
-                "lder": lder_r
+                "jaccard": jac_mean,
+                "jer": jer_r
             }
-            
+
             print(
                 f"[REF {label_str}] RefSpeech={ref_t:.3f}s  "
-                f"Miss={miss_t:.3f}s  Conf={conf_t:.3f}s  LDER={lder_r:.6f}"
+                f"Jaccard={jac_mean:.6f}  JER={jer_r:.6f}"
             )
 
-    # ---- Overall top confusions ----
-    print("=== TOP CONFUSIONS OVERALL (ref -> hyp), time-weighted ===")
-    if not g_conf_pairs:
-        print("(none)")
-    else:
-        top_items = sorted(g_conf_pairs.items(), key=lambda kv: kv[1], reverse=True)[: max(0, args.conf_topk)]
-        for (r, h), t in top_items:
-            pct = 100.0 * t / g_ref if g_ref > EPS else 0.0
-            ref_str = fmt_label(r, inv_vocab)
-            hyp_str = fmt_label(h, inv_vocab)
-            
-            # Add to JSON output
-            results["top_confusions_overall"].append({
-                "ref": ref_str,
-                "hyp": hyp_str,
-                "time": t,
-                "percent_of_ref_speech": pct
-            })
-            
-            print(f"{ref_str} -> {hyp_str}\t{t:.3f}s\t({pct:.2f}% of RefSpeech)")
-
-    # ---- Confusions grouped by ground-truth language ----
-    print("=== TOP CONFUSIONS BY GROUND-TRUTH LANGUAGE (REF) ===")
-    # Sort refs by confusion time (descending), with ref speech as tie-breaker
-    ref_labels2 = sorted(
-        ref_speech_by_label.keys(),
-        key=lambda r: (conf_total_by_ref.get(r, 0.0), ref_speech_by_label.get(r, 0.0)),
-        reverse=True,
-    )
-
-    if not ref_labels2:
-        print("(none)")
-        if args.output_json:
-            with open(args.output_json, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
-            print(f"\n=== Results saved to: {args.output_json} ===")
-        return
-
-    for r in ref_labels2:
-        ref_t = float(ref_speech_by_label.get(r, 0.0))
-        if ref_t < args.min_ref_time:
-            continue
-
-        conf_t = float(conf_total_by_ref.get(r, 0.0))
-        conf_rate = (conf_t / ref_t) if ref_t > EPS else float("nan")
-        
-        ref_str = fmt_label(r, inv_vocab)
-
-        print(
-            f"[REF {ref_str}] RefSpeech={ref_t:.3f}s  Conf={conf_t:.3f}s  "
-            f"ConfRate={conf_rate:.4f}"
-        )
-
-        hyp_map = conf_by_ref.get(r, {})
-        if not hyp_map:
-            print("  (no confusions)")
-            results["top_confusions_by_ref"][ref_str] = {
-                "ref_speech": ref_t,
-                "total_conf": conf_t,
-                "conf_rate": conf_rate,
-                "confusions": []
-            }
-            continue
-
-        top_h = sorted(hyp_map.items(), key=lambda kv: kv[1], reverse=True)[: max(0, args.per_ref_topk)]
-        
-        # Add to JSON output
-        confusion_list = []
-        for h, t in top_h:
-            pct_ref = 100.0 * t / ref_t if ref_t > EPS else 0.0
-            hyp_str = fmt_label(h, inv_vocab)
-            confusion_list.append({
-                "hyp": hyp_str,
-                "time": t,
-                "percent_of_ref_speech": pct_ref
-            })
-            print(f"  {ref_str} -> {hyp_str}\t{t:.3f}s\t({pct_ref:.2f}% of REF speech)")
-        
-        results["top_confusions_by_ref"][ref_str] = {
-            "ref_speech": ref_t,
-            "total_conf": conf_t,
-            "conf_rate": conf_rate,
-            "confusions": confusion_list
-        }
-    
     # Save JSON output if requested
     if args.output_json:
         with open(args.output_json, 'w', encoding='utf-8') as f:
